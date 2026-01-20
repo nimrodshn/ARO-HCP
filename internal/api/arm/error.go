@@ -203,6 +203,14 @@ func NewInternalServerError() *CloudError {
 		"Internal server error.")
 }
 
+// NewInternalServerErrorWithMessage creates a CloudError for an internal server error
+func NewInternalServerErrorWithMessage(msg string) *CloudError {
+	return NewCloudError(
+		http.StatusInternalServerError,
+		CloudErrorCodeInternalServerError, "",
+		"%s", msg)
+}
+
 // WriteInternalServerError writes an internal server error to the given ResponseWriter
 func WriteInternalServerError(w http.ResponseWriter) {
 	WriteCloudError(w, NewInternalServerError())

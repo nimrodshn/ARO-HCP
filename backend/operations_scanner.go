@@ -1055,8 +1055,12 @@ func convertNodePoolStatus(op operation, nodePoolStatus *arohcpv1alpha1.NodePool
 		// XXX OCM SDK offers no error code or message for failed node pool
 		//     operations so "Internal Server Error" is all we can do for now.
 		//     https://issues.redhat.com/browse/ARO-14969
+		if msg, ok := nodePoolStatus.GetMessage(); ok {
+			opError = arm.NewInternalServerErrorWithMessage(msg).CloudErrorBody
+		} else {
+			opError = arm.NewInternalServerError().CloudErrorBody
+		}
 		opStatus = arm.ProvisioningStateFailed
-		opError = arm.NewInternalServerError().CloudErrorBody
 	default:
 		err = fmt.Errorf("unhandled NodePoolState '%s'", state)
 	}
