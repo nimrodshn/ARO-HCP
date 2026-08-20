@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -37,6 +36,7 @@ import (
 	"github.com/Azure/ARO-HCP/internal/api/kubeapplierapi"
 	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
 	controllerutil "github.com/Azure/ARO-HCP/internal/controllerutils"
+	"github.com/Azure/ARO-HCP/internal/restmapper"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/billingcosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/corecosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosstorageutils"
@@ -227,10 +227,14 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 			continue
 		}
 
-		desireName := applyDesireNameForResource(&unstructuredObj)
+		desireName, err := applyDesireNameForResource(&unstructuredObj)
+		if err != nil {
+			logger.Error(err, "failed to resolve resource name, skipping", "resourceKey", resourceKey)
+			continue
+		}
 		desiredNames[desireName] = true
 
-		err := c.createApplyDesireFromResource(ctx, key, managementCluster, &unstructuredObj)
+		err = c.createApplyDesireFromResource(ctx, key, managementCluster, &unstructuredObj)
 		if err != nil {
 			logger.Error(err, "failed to create ApplyDesire for resource",
 				"resourceKey", resourceKey,
@@ -254,12 +258,19 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 // ApplyDesire from the Kubernetes resource it carries. The format is
 // "{resource}.{namespace}.{name}" for namespaced resources and
 // "{resource}.{name}" for cluster-scoped ones, all lowercased.
-func applyDesireNameForResource(resource *unstructured.Unstructured) string {
-	gvr, _ := meta.UnsafeGuessKindToResource(resource.GroupVersionKind())
-	if ns := resource.GetNamespace(); ns != "" {
-		return gvr.Resource + "." + ns + "." + resource.GetName()
+func applyDesireNameForResource(resource *unstructured.Unstructured) (string, error) {
+	gvr, err := restmapper.ResourceFor(resource.GroupVersionKind())
+	if err != nil {
+		return "", fmt.Errorf("resolve resource for %v: %w", resource.GroupVersionKind(), err)
 	}
-	return gvr.Resource + "." + resource.GetName()
+	return desireNameFromGVR(gvr.Resource, resource.GetNamespace(), resource.GetName()), nil
+}
+
+func desireNameFromGVR(resource, namespace, name string) string {
+	if namespace != "" {
+		return resource + "." + namespace + "." + name
+	}
+	return resource + "." + name
 }
 
 // createApplyDesireFromResource creates an ApplyDesire document for a single resource
@@ -269,8 +280,11 @@ func (c *clusterResourcesController) createApplyDesireFromResource(
 	managementCluster *azcorearm.ResourceID,
 	resource *unstructured.Unstructured,
 ) error {
-	gvr, _ := meta.UnsafeGuessKindToResource(resource.GroupVersionKind())
-	desireName := applyDesireNameForResource(resource)
+	gvr, err := restmapper.ResourceFor(resource.GroupVersionKind())
+	if err != nil {
+		return utils.TrackError(fmt.Errorf("resolve resource for %v: %w", resource.GroupVersionKind(), err))
+	}
+	desireName := desireNameFromGVR(gvr.Resource, resource.GetNamespace(), resource.GetName())
 
 	resourceIDString := kubeapplierapi.ToClusterScopedApplyDesireResourceIDString(
 		key.SubscriptionID,

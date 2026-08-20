@@ -639,7 +639,8 @@ func TestApplyDesireNameForResource(t *testing.T) {
 			var obj unstructured.Unstructured
 			err := json.Unmarshal([]byte(tt.resource), &obj)
 			require.NoError(t, err, "failed to unmarshal test resource")
-			got := applyDesireNameForResource(&obj)
+			got, err := applyDesireNameForResource(&obj)
+			require.NoError(t, err, "applyDesireNameForResource should not error for known resource type")
 			assert.Equal(t, tt.want, got, "applyDesireNameForResource mismatch")
 		})
 	}
