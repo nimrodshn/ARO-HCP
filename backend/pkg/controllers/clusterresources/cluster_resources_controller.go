@@ -18,11 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	utilsclock "k8s.io/utils/clock"
 
@@ -35,7 +33,6 @@ import (
 	"github.com/Azure/ARO-HCP/internal/api/coreapi"
 	"github.com/Azure/ARO-HCP/internal/api/kubeapplierapi"
 	"github.com/Azure/ARO-HCP/internal/api/metadataapi"
-	controllerutil "github.com/Azure/ARO-HCP/internal/controllerutils"
 	"github.com/Azure/ARO-HCP/internal/restmapper"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/billingcosmosstorage"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/corecosmosstorage"
@@ -218,6 +215,19 @@ func (c *clusterResourcesController) fetchAndProcessClusterResources(ctx context
 func (c *clusterResourcesController) processClusterResources(ctx context.Context, key controllerutils.HCPClusterKey,
 	managementCluster *azcorearm.ResourceID, resources *arohcpv1alpha1.ClusterResources) error {
 	logger := utils.LoggerFromContext(ctx)
+
+	kubeApplierDBClient := c.kubeApplierDBClients.For(ctx, managementCluster)
+	if kubeApplierDBClient == nil {
+		return nil
+	}
+	applyDesireCRUD, err := kubeApplierDBClient.ApplyDesiresForCluster(key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName)
+	if err != nil {
+		return utils.TrackError(fmt.Errorf("failed to get kube-applier CRUD: %w", err))
+	}
+
+	parent := kubeapplierhelpers.DesireParent{}
+	tags := map[string]string{kubeapplierapi.TagKeyControllerName: ClusterResourcesControllerName}
+
 	resourceMap := resources.Resources()
 	desiredNames := make(map[string]bool, len(resourceMap))
 	for resourceKey, resourceValue := range resourceMap {
@@ -227,24 +237,28 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 			continue
 		}
 
-		desireName, err := applyDesireNameForResource(&unstructuredObj)
+		gvr, err := restmapper.ResourceFor(unstructuredObj.GroupVersionKind())
 		if err != nil {
-			logger.Error(err, "failed to resolve resource name, skipping", "resourceKey", resourceKey)
+			logger.Error(err, "failed to resolve resource, skipping", "resourceKey", resourceKey)
 			continue
 		}
+
+		desireName := desireNameFromGVR(gvr.Resource, unstructuredObj.GetNamespace(), unstructuredObj.GetName())
 		desiredNames[desireName] = true
 
-		err = c.createApplyDesireFromResource(ctx, key, managementCluster, &unstructuredObj)
-		if err != nil {
-			logger.Error(err, "failed to create ApplyDesire for resource",
-				"resourceKey", resourceKey,
-				"desireName", desireName)
-			return err
+		target := kubeapplierapi.ResourceReference{
+			Group:     gvr.Group,
+			Version:   gvr.Version,
+			Resource:  gvr.Resource,
+			Name:      unstructuredObj.GetName(),
+			Namespace: unstructuredObj.GetNamespace(),
 		}
 
-		logger.Info("synced ApplyDesire for resource",
-			"resourceKey", resourceKey,
-			"desireName", desireName)
+		if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyDesireCRUD, c.applyDesireLister, parent,
+			key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName,
+			desireName, managementCluster, target, &unstructuredObj, tags); err != nil {
+			return err
+		}
 	}
 
 	if err := c.deleteStaleApplyDesires(ctx, key, managementCluster, desiredNames); err != nil {
@@ -271,116 +285,6 @@ func desireNameFromGVR(resource, namespace, name string) string {
 		return resource + "." + namespace + "." + name
 	}
 	return resource + "." + name
-}
-
-// createApplyDesireFromResource creates an ApplyDesire document for a single resource
-func (c *clusterResourcesController) createApplyDesireFromResource(
-	ctx context.Context,
-	key controllerutils.HCPClusterKey,
-	managementCluster *azcorearm.ResourceID,
-	resource *unstructured.Unstructured,
-) error {
-	gvr, err := restmapper.ResourceFor(resource.GroupVersionKind())
-	if err != nil {
-		return utils.TrackError(fmt.Errorf("resolve resource for %v: %w", resource.GroupVersionKind(), err))
-	}
-	desireName := desireNameFromGVR(gvr.Resource, resource.GetNamespace(), resource.GetName())
-
-	resourceIDString := kubeapplierapi.ToClusterScopedApplyDesireResourceIDString(
-		key.SubscriptionID,
-		key.ResourceGroupName,
-		key.HCPClusterName,
-		desireName,
-	)
-
-	resourceID, err := azcorearm.ParseResourceID(resourceIDString)
-	if err != nil {
-		return utils.TrackError(fmt.Errorf("failed to parse resource ID: %w", err))
-	}
-
-	kubeContentBytes, err := json.Marshal(resource)
-	if err != nil {
-		return utils.TrackError(fmt.Errorf("failed to marshal resource to JSON: %w", err))
-	}
-
-	applyDesire := &kubeapplierapi.ApplyDesire{
-		CosmosMetadata: coreapi.CosmosMetadata{
-			ResourceID:   resourceID,
-			PartitionKey: strings.ToLower(managementCluster.String()),
-		},
-		Tags: map[string]string{kubeapplierapi.TagKeyControllerName: ClusterResourcesControllerName},
-		Spec: kubeapplierapi.ApplyDesireSpec{
-			ManagementCluster: managementCluster,
-			Type:              kubeapplierapi.ApplyDesireTypeServerSideApply,
-			TargetItem: kubeapplierapi.ResourceReference{
-				Group:     gvr.Group,
-				Version:   gvr.Version,
-				Resource:  gvr.Resource,
-				Name:      resource.GetName(),
-				Namespace: resource.GetNamespace(),
-			},
-			ServerSideApply: &kubeapplierapi.ServerSideApplyConfig{
-				KubeContent: &runtime.RawExtension{Raw: kubeContentBytes},
-			},
-		},
-	}
-
-	kubeApplierDBClient := c.kubeApplierDBClients.For(ctx, managementCluster)
-	if kubeApplierDBClient == nil {
-		return utils.TrackError(fmt.Errorf("no kube-applier database client available for management cluster: %s", managementCluster))
-	}
-
-	kubeApplierCRUD, err := kubeApplierDBClient.ApplyDesiresForCluster(key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName)
-	if err != nil {
-		return utils.TrackError(fmt.Errorf("failed to get kube-applier CRUD: %w", err))
-	}
-
-	existing, err := getExistingApplyDesire(ctx, kubeApplierCRUD, desireName)
-	if err != nil {
-		return err
-	}
-	if !applyDesireNeedsWork(existing, applyDesire) {
-		return nil
-	}
-	if existing == nil {
-		if _, err := kubeApplierCRUD.Create(ctx, applyDesire, nil); err != nil {
-			if !cosmosstorageutils.IsConflictError(err) {
-				return utils.TrackError(fmt.Errorf("create ApplyDesire: %w", err))
-			}
-			existing, err = getExistingApplyDesire(ctx, kubeApplierCRUD, desireName)
-			if err != nil {
-				return err
-			}
-			if existing == nil {
-				return utils.TrackError(fmt.Errorf("create ApplyDesire: conflict but document not found on re-read"))
-			}
-			if !applyDesireNeedsWork(existing, applyDesire) {
-				return nil
-			}
-		} else {
-			return nil
-		}
-	}
-	replacement := existing.DeepCopy()
-	replacement.Spec = *applyDesire.Spec.DeepCopy()
-	if _, err := kubeApplierCRUD.Replace(ctx, replacement, nil); err != nil {
-		return utils.TrackError(fmt.Errorf("replace ApplyDesire: %w", err))
-	}
-
-	return nil
-}
-
-func getExistingApplyDesire(
-	ctx context.Context, crud cosmosstorageutils.ResourceCRUD[kubeapplierapi.ApplyDesire, *kubeapplierapi.ApplyDesire], resourceName string,
-) (*kubeapplierapi.ApplyDesire, error) {
-	existing, err := crud.Get(ctx, resourceName)
-	if cosmosstorageutils.IsNotFoundError(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, utils.TrackError(fmt.Errorf("get ApplyDesire: %w", err))
-	}
-	return existing, nil
 }
 
 func (c *clusterResourcesController) deleteStaleApplyDesires(
@@ -427,44 +331,3 @@ func (c *clusterResourcesController) deleteStaleApplyDesires(
 	return nil
 }
 
-// applyDesireNeedsWork reports whether existing matches desired in the
-// fields the backend writes (Spec content). A nil existing means "doesn't exist yet" — work is required.
-func applyDesireNeedsWork(existing, desired *kubeapplierapi.ApplyDesire) bool {
-	if existing == nil {
-		return true
-	}
-	if !controllerutil.ResourceIDsEqual(existing.Spec.ManagementCluster, desired.Spec.ManagementCluster) {
-		return true
-	}
-	if existing.Spec.Type != desired.Spec.Type {
-		return true
-	}
-	if existing.Spec.TargetItem != desired.Spec.TargetItem {
-		return true
-	}
-	// For ServerSideApply, compare the KubeContent
-	if existing.Spec.ServerSideApply == nil && desired.Spec.ServerSideApply == nil {
-		return false
-	}
-	if existing.Spec.ServerSideApply == nil || desired.Spec.ServerSideApply == nil {
-		return true
-	}
-	if existing.Spec.ServerSideApply.KubeContent == nil && desired.Spec.ServerSideApply.KubeContent == nil {
-		return false
-	}
-	if existing.Spec.ServerSideApply.KubeContent == nil || desired.Spec.ServerSideApply.KubeContent == nil {
-		return true
-	}
-	// Compare the raw content bytes
-	existingRaw := existing.Spec.ServerSideApply.KubeContent.Raw
-	desiredRaw := desired.Spec.ServerSideApply.KubeContent.Raw
-	if len(existingRaw) != len(desiredRaw) {
-		return true
-	}
-	for i := range existingRaw {
-		if existingRaw[i] != desiredRaw[i] {
-			return true
-		}
-	}
-	return false
-}
