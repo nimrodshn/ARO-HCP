@@ -17,6 +17,7 @@ package clusterresources
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -230,6 +231,7 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 
 	resourceMap := resources.Resources()
 	desiredNames := make(map[string]bool, len(resourceMap))
+	var errs []error
 	for resourceKey, resourceValue := range resourceMap {
 		var unstructuredObj unstructured.Unstructured
 		if err := json.Unmarshal([]byte(resourceValue), &unstructuredObj); err != nil {
@@ -257,8 +259,11 @@ func (c *clusterResourcesController) processClusterResources(ctx context.Context
 		if err := kubeapplierhelpers.EnsureApplyDesire(ctx, applyDesireCRUD, c.applyDesireLister, parent,
 			key.SubscriptionID, key.ResourceGroupName, key.HCPClusterName,
 			desireName, managementCluster, target, &unstructuredObj, tags); err != nil {
-			return err
+			errs = append(errs, err)
 		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
 	}
 
 	if err := c.deleteStaleApplyDesires(ctx, key, managementCluster, desiredNames); err != nil {
